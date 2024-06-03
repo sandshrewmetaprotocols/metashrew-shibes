@@ -1,14 +1,15 @@
 import { MetashrewOrd } from "./rpc";
 import yargs from "yargs";
 yargs.parserConfiguration({
-  'parse-numbers': false
+  "parse-numbers": false,
 });
 
 const args = yargs.parse();
 
 const client = new MetashrewOrd({
-  baseUrl: args.url || process.env.METASHREW_VIEW_URL || 'http://localhost:8080',
-  ...args
+  baseUrl:
+    args.url || process.env.METASHREW_VIEW_URL || "http://localhost:8080",
+  ...args,
 });
 
 export async function run(): Promise<void> {
