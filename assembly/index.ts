@@ -1,11 +1,6 @@
 import { Box, RCBox } from "metashrew-as/assembly/utils/box";
 import { _flush, input, get, set } from "metashrew-as/assembly/indexer/index";
-import {
-  parseBytes,
-  parsePrimitive,
-  concat,
-  primitiveToBuffer,
-} from "metashrew-as/assembly/utils/utils";
+import { parseBytes, parsePrimitive, concat, reverse, primitiveToBuffer } from "metashrew-as/assembly/utils/utils";
 import { Block } from "metashrew-as/assembly/blockdata/block";
 import {
   Transaction,
@@ -52,10 +47,14 @@ export function trap(): void {
   unreachable();
 }
 
+function reverseOutput(v: ArrayBuffer): ArrayBuffer {
+  return Box.concat([ Box.from(reverse(Box.from(v).shrinkBack(4).toArrayBuffer())), Box.from(v).shrinkFront(32) ]);
+}
+
 function rangeLength<K>(bst: BST<K>, key: K, max: K): K {
   const greater = bst.seekGreater(key);
-  const end = greater === 0 ? max : greater;
-  return end - key;
+  if (greater > max || greater === 0) return max - key;
+  return greater - key;
 }
 
 function min<T>(a: T, b: T): T {
@@ -91,34 +90,60 @@ class SatRanges {
   constructor(sats: Array<u64>, distances: Array<u64>) {
     this.sats = sats;
     this.distances = distances;
+    /*
+    for (let i = 0; i < this.sats.length; i++) {
+      console.log('range:[' + this.sats[0].toString(10) + ', ' + this.distances[0].toString(10) + ']');
+    }
+    console.log('ranges constructed');
+   */
   }
-  static fromSats(sats: Array<u64>): SatRanges {
-    const distances = new Array<u64>(sats.length);
+  join(): SatRanges {
+    const sats = new Array<u64>(0);
+    const distances = new Array<u64>(0);
+    for (let i = 0; i < this.sats.length; i++) {
+      let sat = this.sats[i];
+      let distance = this.distances[i];
+      while (i < this.sats.length) {
+        if (i !== this.sats.length - 1 && sat + distance === this.sats[i + 1]) {
+          distance += this.distances[i];
+	  i++;
+	} else break;
+      }
+      sats.push(sat);
+      distances.push(distance);
+    }
+    this.sats = sats;
+    this.distances = distances;
+    return this;
+  }
+  static fromSats(sats: Array<u64>, rangeEnd: u64): SatRanges {
+	  /*
+    sats.sort((a: u64, b: u64) => {
+      if (a < b) return -1;
+      if (a > b) return 1;
+      return 0;
+    });
+   */
+    const distances = new Array<u64>(max(sats.length, 1));
     for (let i = 0; i < sats.length; i++) {
-      distances[i] = rangeLength<u64>(
-        SAT_TO_OUTPOINT,
-        sats[i],
-        STARTING_SAT.getValue<u64>(),
-      );
+      distances[i] = rangeLength<u64>(SAT_TO_OUTPOINT, sats[i], rangeEnd);
     }
     return new SatRanges(sats, distances);
   }
   pull(): SatRanges {
+	  /*
+    console.log('pull sats:');
+    for (let i = 0; i < this.sats.length; i++) {
+      console.log(this.sats[i].toString(10));
+    }
+   */
     this.sats.forEach((v: u64, i: i32, ary: Array<u64>) => {
-      SAT_TO_OUTPOINT.nullify(v);
+      setSat(v, new ArrayBuffer(0));
     });
     return this;
   }
-  static fromTransaction(tx: Transaction): SatRanges {
-    return SatRanges.fromSats(
-      flatten(
-        tx.ins.map<Array<u64>>((v: Input) =>
-          OUTPOINT_TO_SAT.select(
-            v.previousOutput().toArrayBuffer(),
-          ).getListValues<u64>(),
-        ),
-      ),
-    );
+  static fromTransaction(tx: Transaction, rangeEnd: u64): SatRanges {
+    return SatRanges.fromSats(flatten(tx.ins.map<Array<u64>>((v: Input) => OUTPOINT_TO_SAT.select(v.previousOutput().toArrayBuffer()).getListValues<u64>())), rangeEnd);
   }
 }
 
@@ -129,8 +154,8 @@ class SatSource {
   constructor(ranges: SatRanges) {
     this.ranges = ranges;
   }
-  static fromTransaction(tx: Transaction): SatSource {
-    return new SatSource(SatRanges.fromTransaction(tx));
+  static fromTransaction(tx: Transaction, rangeEnd: u64): SatSource {
+    return new SatSource(SatRanges.fromTransaction(tx, rangeEnd));
   }
   consumed(): boolean {
     return (
@@ -140,7 +165,7 @@ class SatSource {
     );
   }
   pull(): SatSource {
-    this.ranges.pull();
+    this.ranges.pull().join();
     return this;
   }
   static range(sat: u64, distance: u64): SatSource {
@@ -170,6 +195,17 @@ class SatSink {
     return OutPoint.from(this.target.txid(), this.pointer).toArrayBuffer();
   }
   consume(source: SatSource): void {
+	  /*
+    console.log(Box.from(this.target.txid()).toHexString());
+    console.log(source.consumed() ? "consumed" : "not consumed");
+    console.log(this.filled() ? "filled" : "not filled");
+    source.ranges.sats.forEach((v: u64, i: i32, ary: Array<u64>) => {
+      console.log('sat:' + v.toString(10));
+    });
+    source.ranges.distances.forEach((v: u64, i: i32, ary: Array<u64>) => {
+      console.log('distance:' + v.toString(10));
+    });
+   */
     while (!source.consumed() && !this.filled()) {
       const sourceRemaining =
         source.ranges.distances[source.pointer] - source.offset;
@@ -177,7 +213,13 @@ class SatSink {
         this.target.outs[this.pointer].value - this.offset;
       const outpoint = this.currentOutpoint();
       const sat = source.ranges.sats[source.pointer] + source.offset;
-      SAT_TO_OUTPOINT.set(sat, outpoint);
+      /*
+      source.ranges.sats.forEach((v: u64, i: i32, ary: Array<u64>) => {
+        console.log(v.toString(10));
+      });
+      console.log(sat.toString());
+     */
+      setSat(sat, outpoint);
       OUTPOINT_TO_SAT.select(outpoint).appendValue<u64>(sat);
       if (targetRemaining < sourceRemaining) {
         this.pointer++;
@@ -200,6 +242,12 @@ class SatSink {
   }
 }
 
+function setSat(sat: u64, outpoint: ArrayBuffer): void {
+//  console.log(sat.toString(10) + ":" + Box.from(outpoint).toHexString());
+  SAT_TO_OUTPOINT.set(sat, outpoint);
+  if (outpoint.byteLength === 0) SAT_TO_OUTPOINT.unmarkPath(sat);
+}
+
 function excessSats(source: SatSource): void {
   while (!source.consumed()) {
     const sourceRemaining =
@@ -207,7 +255,7 @@ function excessSats(source: SatSource): void {
     const outpoint = new ArrayBuffer(36);
     store<u32>(changetype<usize>(outpoint) + 34, bswap<u16>(0xdead));
     const sat = source.ranges.sats[source.pointer] + source.offset;
-    SAT_TO_OUTPOINT.set(sat, outpoint);
+    setSat(sat, outpoint);
     OUTPOINT_TO_SAT.select(outpoint).appendValue<u64>(sat);
     source.offset = 0;
     source.pointer++;
@@ -230,10 +278,7 @@ class Index {
     let total = 0;
     let offset: u64 = 0;
     let outputIndex: i32 = 0;
-    //console.log(height.toString(10));
-    //console.log(Box.from(txid).toHexString());
     for (let i = 0; i < tx.ins.length; i++) {
-      //console.log(i.toString(10));
       if (outputIndex >= tx.outs.length) break;
       const inscription = tx.ins[i].inscription();
       if (inscription !== null) {
@@ -341,6 +386,20 @@ class Index {
       Index.indexOutputValuesForTransaction(block.transactions[i]);
     }
   }
+  static sortOutPoints(tx: Transaction): void {
+    const txid = tx.txid();
+    for (let i = 0; i < tx.outs.length; i++) {
+      const outpoint = OutPoint.from(txid, i).toArrayBuffer();
+      const sats = OUTPOINT_TO_SAT.select(outpoint).getListValues<u64>().sort((a: u64, b: u64) => {
+	if (a < b) return -1;
+	if (a > b) return 1;
+	return 0;
+      });
+      for (let j = 0; j < sats.length; j++) {
+        OUTPOINT_TO_SAT.selectIndex(j).setValue<u64>(sats[j]);
+      }
+    }
+  }
   static indexBlock(height: u32, block: Block): void {
     HEIGHT_TO_BLOCKHASH.selectValue<u32>(height).set(block.blockhash());
     BLOCKHASH_TO_HEIGHT.select(block.blockhash()).setValue<u32>(height);
@@ -356,11 +415,11 @@ class Index {
     for (let i: i32 = 1; i < block.transactions.length; i++) {
       const tx = block.transactions[i];
       const transactionSink = SatSink.fromTransaction(tx);
-      const transactionSource = SatSource.fromTransaction(tx).pull();
+      const transactionSource = SatSource.fromTransaction(tx, startingSat).pull();
       transactionSink.consume(transactionSource);
       const txid = tx.txid();
-      if (!transactionSource.consumed())
-        coinbaseSink.consume(transactionSource);
+      if (!transactionSource.consumed()) coinbaseSink.consume(transactionSource);
+      if (!transactionSource.consumed() && coinbaseSink.filled()) excessSats(transactionSource);
       Index.indexTransactionInscriptions(tx, txid, height);
     }
     excessSats(coinbaseSource);
@@ -378,15 +437,6 @@ function decodeHex(hex: string): ArrayBuffer {
   return result;
 }
 
-/*
-function test_storage_persisted(): void {
-  let outpoint = OutPoint.from(decodeHex("04c3d4dd40af599514fa2861fbc884f7ee9bcb7717763cb84332319bb16c5fac"), 17).toArrayBuffer();
-  let value = OUTPOINT_TO_VALUE.select(outpoint).getValue<u64>();
-  console.log('value: ' + value.toString(10));
-  //if (value !== 0) throw Error('abort');
-}
-*/
-
 export function _start(): void {
   const data = input();
   const box = Box.from(data);
@@ -396,18 +446,9 @@ export function _start(): void {
   _flush();
 }
 
-export function satranges(): ArrayBuffer {
-  const box = Box.from(input());
-  const height = parsePrimitive<u32>(box);
-  const data = box.toArrayBuffer();
-  const request = ordinals.SatRangesRequest.decode(data);
-  const sats = OUTPOINT_TO_SAT.select(
-    OutPoint.from(
-      request.outpoint.hash.buffer,
-      request.outpoint.vout,
-    ).toArrayBuffer(),
-  ).getListValues<u64>();
-  const response = new ordinals.SatRangesResponse();
+function outpointToSatRanges(outpoint: OutPoint): ordinals.SatRanges {
+  const sats = OUTPOINT_TO_SAT.select(outpoint.toArrayBuffer()).getListValues<u64>();
+  const result = new ordinals.SatRanges();
   const distances = sats.map<u64>((v: u64, i: i32, ary: Array<u64>) => {
     return rangeLength<u64>(SAT_TO_OUTPOINT, v, STARTING_SAT.getValue<u64>());
   });
@@ -415,28 +456,44 @@ export function satranges(): ArrayBuffer {
     const range = new ordinals.SatRange();
     range.start = sats[i];
     range.distance = distances[i];
-    response.satranges.ranges.push(range);
+    result.ranges.push(range);
   }
+  return result;
+}
+
+export function satranges(): ArrayBuffer {
+  const box = Box.from(input());
+  const height = parsePrimitive<u32>(box);
+  const data = box.toArrayBuffer();
+  const request = ordinals.SatRangesRequest.decode(data);
+  const outpoint = OutPoint.from(request.outpoint.hash.buffer, request.outpoint.vout);
+  const response = new ordinals.SatRangesResponse();
+  response.satranges = outpointToSatRanges(outpoint);
   return response.encode();
 }
 
+function arrayBufferToArray(data: ArrayBuffer): Array<u8> {
+  const result = new Array<u8>(data.byteLength);
+  store<usize>(changetype<usize>(result), changetype<usize>(data));
+  store<usize>(changetype<usize>(result) + sizeof<usize>(), changetype<usize>(data));
+  return result;
+}
+
 export function sat(): ArrayBuffer {
-  const point = new Sat(parsePrimitive<u64>(Box.from(input())));
-  return toRLP(
-    RLPItem.fromList([
-      RLPItem.fromValue(<usize>point.n()),
-      RLPItem.fromArrayBuffer(
-        String.UTF8.encode(
-          point.height().n().toString(10) + "." + point.third().toString(10),
-        ),
-      ),
-      RLPItem.fromValue(<usize>point.height().n()),
-      RLPItem.fromValue(<usize>point.cycle()),
-      RLPItem.fromValue(<usize>point.epoch().n()),
-      RLPItem.fromValue(<usize>point.period()),
-      RLPItem.fromValue(<usize>point.third()),
-    ]),
-  );
+  const box = Box.from(input());
+  const height = parsePrimitive<u32>(box);
+  const data = box.toArrayBuffer();
+  const request = ordinals.SatRequest.decode(data);
+  const response = new ordinals.SatResponse();
+  const start = SAT_TO_OUTPOINT.seekLower(request.sat + 1);
+  response.pointer = request.sat - start;
+  const outpoint = new OutPoint(Box.from(reverseOutput(SAT_TO_OUTPOINT.get(start))));
+  response.outpoint.hash = arrayBufferToArray(outpoint.txid.toArrayBuffer());
+  response.outpoint.vout = outpoint.index;
+  response.satrange.start = start;
+  response.satrange.distance = rangeLength<u64>(SAT_TO_OUTPOINT, start, STARTING_SAT.getValue<u64>());
+  response.satranges = outpointToSatRanges(outpoint);
+  return response.encode();
 }
 
 export function inscription(): ArrayBuffer {
@@ -472,25 +529,9 @@ export function output(): ArrayBuffer {
 export function test_arrayBufferCopy(): void {
   const buffer = new ArrayBuffer(4);
   store<u32>(changetype<usize>(buffer), 0x55443322);
-  /*
-  console.log(load<usize>(changetype<usize>(buffer)).toString(10));
-  */
   const ary = new Array<u8>(4);
-  /*
-  console.log(changetype<usize>(ary.buffer).toString(10));
-  */
   store<usize>(changetype<usize>(ary), changetype<usize>(buffer));
-  store<usize>(
-    changetype<usize>(ary) + sizeof<usize>(),
-    changetype<usize>(buffer),
-  );
-  /*
-  console.log(load<usize>(changetype<usize>(ary)).toString(10));
-  console.log(changetype<usize>(ary.buffer).toString(10));
-  console.log(changetype<usize>(ary.dataStart).toString(10));
-  console.log(load<usize>(changetype<usize>(ary) + sizeof<usize>()).toString(10));
-  console.log(ary[0].toString(10));
-  */
+  store<usize>(changetype<usize>(ary) + sizeof<usize>(), changetype<usize>(buffer));
 }
 
 export function test_nullTx(): void {
