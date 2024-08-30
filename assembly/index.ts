@@ -442,7 +442,6 @@ export function _start(): void {
   const box = Box.from(data);
   const height = parsePrimitive<u32>(box);
   const block = new Block(box);
-  console.log(block.transactions.length.toString(10));
   Index.indexBlock(height, block);
   _flush();
 }
