@@ -24,6 +24,11 @@ const addHexPrefix = (s: string) => {
   return "0x" + s;
 };
 
+const BLOCKS = [0, 370001, 673363].reduce((r, v) => {
+  r[Number(v)] = addHexPrefix(fs.readFileSync(path.join(__dirname, String(v) + '.hex'), 'utf8'));
+  return r;
+}, {});
+
 const split = (ary, sym) => {
   return ary.reduce((r, v) => {
     if (v === sym) {
@@ -242,7 +247,7 @@ const satRangesForTransaction = async (program, tx) => {
   return result;
 };
 
-describe("metashrew-ord", () => {
+describe("metashrew-shibes", () => {
   it("should index satranges", async () => {
     const program = buildProgram();
     program.setBlockHeight(0);
@@ -258,7 +263,7 @@ describe("metashrew-ord", () => {
       await satRangesForTransaction(program, coinbaseBlock.transactions[0]),
     ).to.eql({
       "5c28236f2c0ca66a078c01ed45b7cefc21e5b8373458be17bbb5ce0a00e00bab:0": [
-        { start: 0n, distance: 5000000000n },
+        { start: 0n, distance: 5000000050n },
       ],
     });
     block.transactions.push(buildCoinbaseToRandomAddress());
@@ -391,5 +396,23 @@ describe("metashrew-ord", () => {
     program.setBlockHeight(2);
     await program.run('_start');
     console.log(Object.values(await satRangesForTransaction(program, block3.transactions[1])));//[0][2].distance).to.eql(20n);
+  });
+  it('should index the genesis block', async () => {
+    const program = buildProgram();
+    program.setBlock(BLOCKS[0]);
+    program.setBlockHeight(0);
+    await program.run('_start');
+  });
+  it('should index block 370001', async () => {
+    const program = buildProgram();
+    program.setBlock(BLOCKS[370001]);
+    program.setBlockHeight(370001);
+    await program.run('_start');
+  });
+  it('should index block 673363', async () => {
+    const program = buildProgram();
+    program.setBlock(BLOCKS[673363]);
+    program.setBlockHeight(673363);
+    await program.run('_start');
   });
 });
